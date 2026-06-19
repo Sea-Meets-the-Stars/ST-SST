@@ -8,6 +8,7 @@ This repository will be used to create a Python package for the Scattering Trans
 
 1. Read this file.  Execute the 1st task under "Claude/CLAUDE.md file"
 2. Read this file.  Execute the 1st task under "Basic start up"
+3. Read this file.  Execute the 1st task under "Skills"
 
 ## Claude
 
@@ -18,6 +19,8 @@ This repository will be used to create a Python package for the Scattering Trans
     - I will perform git commands
 
 ### Skills
+
+1. Copy over the skills/ files from the IOPtics repository.
 
 ### Settings
 
