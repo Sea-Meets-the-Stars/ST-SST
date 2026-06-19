@@ -1,0 +1,13 @@
+numpy
+scipy
+pandas
+matplotlib
+seaborn
+xarray
+h5netcdf
+cftime
+scikit-learn
+kymatio
+tqdm
+IPython
+pytest
