@@ -8,7 +8,7 @@ Scattering Transform analysis.
 ## Context
 
 - The LLC4320_v2 surface product is a 4320x2160 grid of SST data.  It is stored
-as a zarr file in s3.
+as a zarr file in s3 -- `s3://llc4320-v2/SURFACE`.
 
 
 - The `wrangler` repo used to create that product is located next to this Repo.
@@ -34,6 +34,60 @@ I will use Opus 5.5 for the execution.
 Use Fable for this prompt if you can.  Log your work
 
 ### Implement
+
+Read `reports/extract_llc4320v2_gulf_stream.md` before each of these; it holds the
+settled design. Use the `ocean14` environment. Log each prompt under `## Logs`.
+
+1. Write the library module `st_sst/extract/llc_v2_cutouts.py` (and `st_sst/extract/__init__.py`)
+   with pure, testable functions: `tile_extent(dx_1d, dy_1d, j0, i0, km)` (fixed-km extents
+   from local spacing, after dbof's `extent_in_i/j`, with attribution), `tile_snapshot(...)`
+   (random-offset regular tiling of a face slice, keeping fully-ocean tiles with centres in
+   the box), `make_cutout(theta, j0, i0, nj, ni, npix)` (slice, transpose to north-up /
+   east-right, `resize_local_mean` to `npix`), `cutout_stats(img, km_w, km_h)` (mean, std,
+   min, max, p10, p90, grad_mean, grad_p90, grad_max in °C/km), `make_uid(time, lat, lon)`
+   (the wrangler/ulmo formula from `wrangler.ogcm.llc.add_uid`, re-implemented), and the
+   snapshot schedule `snapshot_hours(start, end, steps=(9, 10))`. Add
+   `st_sst/tests/test_llc_v2_cutouts.py` with network-free tests on a synthetic single-face
+   grid built in memory (dims `face, j, i, j_g, i_g`; `XC`, `YC`, `dxC`, `dyC`, `maskC`,
+   `Depth`), including an orientation test (latitude must decrease down the rows,
+   longitude increase along the columns) and a test that 64 px never upsamples for the
+   spacings in the plan. Run `pytest`. Use Opus 5.5.
+
+2. Add the per-snapshot extractor and the NetCDF layer to `st_sst/extract/llc_v2_cutouts.py`:
+   `extract_snapshot(date, grid, box, km, npix, seed) -> (cube, table)` reading one hour
+   with `wrangler.ogcm.llc_v2_access.open_store` sliced to the face and index rectangle
+   from `region_slices`; `write_snapshot_nc(path, cube, table, attrs)` and
+   `concatenate_snapshots(paths, outfile)` producing the layout in the plan (dims
+   `(cutout, y, x)`, chunks `(1024, 64, 64)`, zlib 1, per-cutout variables, global
+   attributes including the Dan Whitt credit). Write the driver
+   `st_sst/scripts/extract_gulf_stream.py` with `--pilot`, `--box`, `--km`, `--npix`,
+   `--seed`, `--stride`, `--n-cores`, `--outdir`, `--dry-run`, `--concatenate`, resuming by
+   skipping existing per-snapshot files. Run the pilot (2023-02-01 12:00 and 2023-08-01
+   12:00 UTC) to `$OS_OGCM/LLC_v2/cutouts/`, producing
+   `LLC4320v2_GulfStream_SST_128km_64px_pilot.nc`. Report the tiles per snapshot and the
+   wall time. Use Opus 5.5.
+
+3. Validate the pilot. Write `st_sst/scripts/plot_pilot_cutouts.py` producing, under
+   `reports/figures/`: the box with the SST snapshot and tile outlines plus ~6 cutouts with
+   their corner coordinates; histograms of `km_w`, `km_h`, `ni`, `nj`; and a printed spot
+   check of a few pixels against `Theta` read directly with xarray at the same
+   `(face, j, i)`. Check `lat_ne > lat_sw`, `lon_ne > lon_sw`, no NaN, unique UIDs, and
+   that the resampling ratio is >= 1 everywhere. Append a "Pilot results" section to
+   `reports/extract_llc4320v2_gulf_stream.md` with the figures, the measured yield, and
+   the stride that gives ~200,000 cutouts. Fix anything the checks reveal. Use Opus 5.5.
+
+4. Full run. From the pilot yield set the default stride (alternating 9/10 h unless the
+   yield says otherwise) and run `extract_gulf_stream.py` over 2023-01-01 01:00 to
+   2024-01-31 23:00 with `--n-cores 8`, resumable, skipping the two missing hours with a
+   logged warning. Then `--concatenate` to
+   `$OS_OGCM/LLC_v2/cutouts/LLC4320v2_GulfStream_SST_128km_64px.nc`. Do not delete the
+   per-snapshot files. Use Opus 5.5.
+
+5. Verify the full dataset with a script `st_sst/scripts/verify_cutouts_nc.py`: total
+   count, no NaN, unique UIDs, time span, histograms of UTC hour and month (should be
+   flat), per-snapshot yield, distributions of the statistics, file size. Append a "Full
+   dataset" section to the plan document with the numbers and figures, and add a short
+   "Reading the cutouts" example (xarray) to `README.md`. Use Opus 5.5.
 
 ## Q&A
 
@@ -346,5 +400,35 @@ What I learned:
 - In the tile-count script the j-extent uses a per-column median of `dyC`, which hides the
   latitude dependence of `dyC` on this rotated face; the count is therefore ±5%. The real
   extractor will use the local spacing at each tile.
+
+No git commands that change repository state were run.
+
+### 2026-10-23 (Plan document and Implement prompts)
+
+Executed Planning prompt #3 (Claude Fable 5.1): wrote the plan and the implementation
+prompts for Opus 5.5.
+
+What was done:
+
+- `reports/extract_llc4320v2_gulf_stream.md`: the settled design in one place (source,
+  measured geometry, eight design decisions, code layout, pilot, full run and
+  verification, risks). The R1 answer (nearly uniform in time, full 13 months, good
+  diurnal sampling) is implemented as alternating 9 h / 10 h steps: two snapshots per
+  19 h, and because 19 is coprime with 24 every UTC hour is visited equally; ~1,000
+  snapshots x ~201 tiles ≈ 200,000. The box stays 30-45N, 80-50W since the eastward
+  extension was not chosen; it is kept as a `--box` parameter.
+- Five Implement prompts under Prompts/Implement: library + tests, extractor + NetCDF +
+  pilot run, pilot validation, full run, verification + README.
+
+What I learned:
+
+- wrangler's `tests/test_llc_v2_access.py` builds a tiny local product with
+  `llc_v2.write_grid_store` / `write_timestep_store`, and `llc_v2_access` works against a
+  local directory; that fixture writes only XC, YC, Depth, so our tests build a synthetic
+  grid in memory (with `dxC`, `dyC`, `maskC` on the staggered axes) instead.
+- Sibling repos keep investigation reports as Markdown in `reports/` with figures in
+  `reports/figures/` and report scripts in `reports/scripts/`; this plan follows that
+  layout, with the analysis scripts kept under `st_sst/scripts/` because they are
+  pipeline tools, not one-off report generators.
 
 No git commands that change repository state were run.
