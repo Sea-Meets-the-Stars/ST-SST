@@ -1,0 +1,52 @@
+# ST-SST CI — light, advisory checks only.
+#
+# One job: `tests` installs the dependencies and runs `pytest -q`
+# (data-dependent tests are expected to skip on the runner — no data tree is
+# mounted — so the suite stays green and fast).  No coverage floor or
+# fail-on-warning.
+
+name: CI
+
+on:
+  push:
+    branches: ['**']
+  pull_request:
+
+# Cancel superseded runs on the same ref to save runner time.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  tests:
+    name: Tests (pytest, py${{ matrix.python-version }})
+    runs-on: ubuntu-latest
+
+    strategy:
+      fail-fast: false
+      matrix:
+        # 3.12 = the declared minimum (setup.py: >=3.12);
+        # 3.14 = the dev environment (the `ocean14` conda env runs 3.14).
+        python-version: ['3.12', '3.14']
+
+    steps:
+      - name: Check out the repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install -e .
+
+      - name: Smoke check (import st_sst)
+        run: python -c "import st_sst; print('st_sst', st_sst.__version__)"
+
+      - name: Run tests
+        run: pytest -q
