@@ -1,0 +1,36 @@
+# Runtime dependencies for st_sst.
+#
+# Keep this list in sync with install_requires in setup.py.
+
+# Core scientific stack
+numpy
+scipy
+pandas
+pyarrow
+matplotlib
+seaborn
+scikit-learn
+tqdm
+IPython
+pytest
+
+# Oceanography / gridded data I/O
+xarray
+h5netcdf
+h5py
+netcdf4
+cftime
+
+# Cloud-hosted Zarr stores (LLC4320_v2 on Nautilus S3, read anonymously)
+zarr
+s3fs
+fsspec
+
+# Scattering-transform backend — not yet chosen; uncomment one.
+# kymatio (wavelet scattering, numpy/torch backends):
+# kymatio
+# torch
+
+# Sibling packages (not on PyPI) — uncomment as they are needed.
+# SST download/processing and LLC4320_v2 access (wrangler/ogcm/llc_v2_access.py):
+# git+https://github.com/Sea-Meets-the-Stars/wrangler
