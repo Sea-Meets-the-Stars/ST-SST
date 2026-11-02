@@ -21,7 +21,7 @@ setup_keywords['provides'] = [setup_keywords['name']]
 setup_keywords['python_requires'] = '>=3.12'
 setup_keywords['install_requires'] = [
     'numpy', 'scipy', 'pandas', 'pyarrow', 'matplotlib', 'seaborn',
-    'scikit-learn', 'tqdm', 'IPython', 'pytest',
+    'scikit-learn', 'scikit-image', 'tqdm', 'IPython', 'pytest',
     # Oceanography / gridded data I/O
     'xarray', 'h5netcdf', 'h5py', 'netcdf4', 'cftime',
     # Cloud-hosted Zarr stores (LLC4320_v2 on Nautilus S3)

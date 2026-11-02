@@ -432,3 +432,51 @@ What I learned:
   pipeline tools, not one-off report generators.
 
 No git commands that change repository state were run.
+
+### 2026-11-02 (Implement #1: cutout library and tests)
+
+Executed Implement prompt #1 (Claude Fable 5.1, at the user's direction, rather than
+Opus 5.5): wrote `st_sst/extract/llc_v2_cutouts.py` and its tests; 23 tests pass under
+`conda run -n ocean14 python -m pytest -q` (1.4 s, no network).
+
+What was done:
+
+- `st_sst/extract/llc_v2_cutouts.py`: `cells_for_km` / `tile_extent` (fixed-km extents
+  from local spacing, after dbof's `extent_in_i/j`, measured from the tile origin so
+  tiles lay edge to edge; `min_cells` guards against upsampling), `face_orientation` /
+  `orient_north_up` / `oriented_km` (the transpose/flip that makes any lat-lon face
+  north-up and east-right, decided from XC/YC), `make_cutout` (slice, orient,
+  `resize_local_mean`; refuses upsampling), `tile_corners`, `tile_snapshot`
+  (random-offset strip tiling, non-overlapping, fully-ocean, centre in box),
+  `cutout_stats` (wrangler's `meta.stats` for the percentiles plus std and |grad T|
+  in °C/km with the realized pixel size), `make_uid`, `parse_utc`, `snapshot_hours`,
+  and the plan's defaults (`DEFAULT_BOX`, `DEFAULT_KM`, `DEFAULT_NPIX`, `DEFAULT_STEPS`,
+  `PILOT_HOURS`, record start/end).
+- `st_sst/tests/test_llc_v2_cutouts.py`: a synthetic face built in memory with the
+  `grid.zarr` dims and staggering (`face, j, i, j_g, i_g`), in a rotated (face-10-like)
+  and an unrotated variant; tests for extents, the no-upsample guarantee at every
+  spacing in the plan (1.53-2.01 km), orientation (latitude decreasing down the rows,
+  longitude increasing along the columns, on both variants, for coordinates and for
+  cutouts), mean preservation, disjoint tiling with land avoided, seeding, the ramp
+  gradient statistic, UID uniqueness and equality with `wrangler.ogcm.llc.add_uid`, and
+  the schedule (alternation, ~1,000 snapshots, flat UTC-hour histogram, 13 months).
+- `scikit-image` added to `requirements.txt` and `setup.py`.
+
+What I learned:
+
+- **pandas 3 defaults datetimes to microseconds**, and `wrangler.ogcm.llc.add_uid`
+  computes its time digits from `.values.astype(int64)` without fixing the unit, so on
+  microsecond datetimes the UID's time part has ~11-day resolution and hourly snapshots
+  would collide. `make_uid` forces nanoseconds first; the test against wrangler
+  therefore uses `.as_unit('ns')`. Worth a one-line fix in wrangler at some point.
+- `tz_localize(None)` on a Series acts on the index, not the values; convert through
+  a `DatetimeIndex`.
+- `resize_local_mean` keeps float32 in/out and preserves the mean to <1e-3 at the
+  non-integer ratios in play (70x76 -> 64x64).
+- On face 10 the spacing along the latitude axis (`dxC`, along `i`) is 1.53-1.85 km and
+  along the longitude axis (`dyC`, along `j`) 1.64-2.01 km; at 2.01 km, 128 km is 63.7
+  cells, so without `min_cells=64` the overshoot rule alone gives exactly 64 and the
+  guard is what makes "never upsample" a guarantee rather than luck.
+- `conda run` does not forward a heredoc on stdin; probe scripts go in a file.
+
+No git commands that change repository state were run.

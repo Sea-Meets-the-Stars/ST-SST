@@ -10,6 +10,7 @@ pyarrow
 matplotlib
 seaborn
 scikit-learn
+scikit-image
 tqdm
 IPython
 pytest
