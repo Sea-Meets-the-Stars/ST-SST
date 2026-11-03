@@ -87,7 +87,9 @@ settled design. Use the `ocean14` environment. Log each prompt under `## Logs`.
    count, no NaN, unique UIDs, time span, histograms of UTC hour and month (should be
    flat), per-snapshot yield, distributions of the statistics, file size. Append a "Full
    dataset" section to the plan document with the numbers and figures, and add a short
-   "Reading the cutouts" example (xarray) to `README.md`. Use Opus 5.5.
+   "Reading the cutouts" example (xarray) to `README.md`. 
+   Be sure to include a figure or two showing example cutouts.
+   Use Opus 5.5.
 
 ## Q&A
 
@@ -680,5 +682,77 @@ What I learned:
 - The bug-fix edit and the new test were applied with a short
   system-`python3` text-substitution one-off, not the `ocean14` environment. It was a
   file edit, not a calculation, but it does not follow the convention.
+
+No git commands that change repository state were run.
+
+### 2026-11-03 (Implement #5: verification, report, README)
+
+Executed Implement prompt #5 (Claude Opus 5.5). Wrote `st_sst/scripts/verify_cutouts_nc.py`,
+verified the full file, appended a "Full dataset" section to
+`reports/extract_llc4320v2_gulf_stream.md`, and added a "Reading the cutouts" section to
+`README.md`. All 19 checks pass (the script exits 0), so nothing was re-extracted and the
+library was not changed. 29 tests pass under `conda run -n ocean14 python -m pytest -q`.
+
+What was done:
+
+- `st_sst/scripts/verify_cutouts_nc.py` (`--file`, `--outdir`, `--prefix full_`,
+  `--n-examples 12`, `--seed 2023`; about 25 s):
+  - reuses `check_cutout_file.main` for the layout checks, then checks no NaN (streamed
+    with `netCDF4` in 1024-cutout blocks), unique UIDs, corner ordering, resampling
+    ratio, km ≥ 128, centre in box, and that the distinct times equal `snapshot_hours()`;
+  - tabulates UTC-hour and month histograms with max/min and χ² (scipy), per-snapshot
+    yield (also split by strips per snapshot), the statistics table, and centre
+    uniformity in an open-ocean interior at 1°/2° and per native row and column;
+  - writes `reports/figures/full_time_histograms.png`, `full_yield.png`,
+    `full_stat_histograms.png`, `full_coverage.png`, `full_example_cutouts.png` (12
+    random, one per twelfth of the span) and `full_example_cutouts_extremes.png`
+    (highest grad_p90, lowest std, warmest/coldest mean, demeaned with `RdBu_r`).
+- `st_sst/scripts/check_cutout_file.py`: the NaN check now streams `sst` through a new
+  `sst_all_finite(path, block=1024)` instead of loading the whole cube. `main` gained
+  `list_snapshots=True`, which the verifier turns off so it does not print 1,001 lines.
+  It also prints a one-line yield summary. The CLI behaviour is unchanged, and it was
+  rerun on the pilot file: all ok.
+- `README.md`: a "Reading the cutouts" section covering the file, layout, credit,
+  raw °C (the analysis demeans), and an xarray example (open, sizes, plot one cutout
+  north-up at its corners, select by month, lat, grad_p90 and UID, demean). It also
+  points to the per-snapshot files, the pilot file and the plan. The example was run
+  against the pilot file from a scratch probe.
+
+Numbers:
+
+- 196,478 cutouts from 1,001 snapshots, 2023-01-01 01:00 to 2024-01-31 21:00 UTC; times
+  equal the 9/10 h schedule. File 1,911.5 MB. 0 non-finite of 804,773,888 pixels; `sst`
+  spans -0.831 to 32.061 °C.
+- UTC hour: 40-42 snapshots and 7,832-8,297 cutouts per hour (max/min 1.059). χ² is 34.3
+  (p 0.06) against uniform and 3.7 (p 1.0) against the snapshot counts. Month:
+  490.7-502.3 cutouts/day; mean yield per month 195.0-197.6.
+- Yield 184-209, mean 196.28, median 193, std 6.93; 3.8% below the pilot projection
+  (204,204). **Bimodal**: 540 snapshots with 12 strips of kept tiles yield 184-194 (mean
+  190.2) and 461 with 13 strips yield 199-209 (mean 203.4). Both pilot snapshots were
+  13-strip cases.
+- Medians: mean 21.3 °C, std 0.53 °C, grad_p90 0.082 °C/km; grad_p90 reaches 1.21 °C/km
+  and std 6.8 °C. min_depth p5 is 21.6 m.
+- Coverage in the interior 33-41N, 65-52W (61,297 cutouts): 1° bins CV 0.051 (Poisson
+  0.041) and 2° bins CV 0.028 (Poisson 0.021), so uniform at large scale. Per native
+  row `ci` the CV is 0.54, with 47 of 512 rows never a centre; per column `cj` the CV is
+  0.11 (Poisson 0.10).
+
+What I learned:
+
+- **Tile-scale non-uniformity of the centres.** `tile_snapshot` draws `i_off` in
+  `[0, ni_typ)` from the median spacing, and strips advance by integer `max_ni`, which
+  shrinks southward (84 to 70 cells). The reachable strip starts compress strip by strip,
+  so in latitude some native rows are never a centre and others pile up. Coverage is
+  uniform at ≥ 1° and every cutout is still valid. This is recorded as an open item in
+  the report with possible fixes (strips laid in km, or a fresh offset per strip), and
+  was not re-extracted. The same mechanism (12 vs 13 strips) makes the yield bimodal.
+- `Dataset.drop_vars('sst').to_dataframe()` still broadcasts over the leftover `y`, `x`
+  dims, building 805 M rows; the first run reached 258 GB RSS before I killed it. Build
+  the table from the 1-D variables instead.
+- `snapshot_hours()` returns tz-aware UTC datetimes while the file's `time` is naive, so
+  the two must be normalized before comparing.
+- Streaming the 1.9 GB `sst` in 1024-cutout blocks takes about 10 s on this machine.
+- `pandas.Period` does not accept strftime-style format specs in f-strings; use `str()` or
+  `.strftime()`.
 
 No git commands that change repository state were run.

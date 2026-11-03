@@ -173,6 +173,146 @@ snapshot; neither missing hour falls on any of these schedules):
 from the per-snapshot yield variation), with a flat UTC-hour histogram. Single strides
 of 9 or 10 h, and 10/11, visit only a subset of UTC hours. Nothing needed fixing.
 
+## Full dataset
+
+*2026-11-03, Implement #4 (run) and #5 (verification) (Claude Opus 5.5). Numbers from
+`conda run -n ocean14 python -m st_sst.scripts.verify_cutouts_nc` (about 25 s; `sst`
+streamed in 1024-cutout blocks, example seed 2023).*
+
+**File.** `$OS_OGCM/LLC_v2/cutouts/LLC4320v2_GulfStream_SST_128km_64px.nc`
+(1,911,516,327 bytes = 1,911.5 MB). **196,478 cutouts** from **1,001 snapshots**, `sst`
+(196478, 64, 64) float32, chunks (1024, 64, 64), zlib 1, plus the 25 per-cutout
+variables of design item 6. Global attributes: `stride_hours` "9 10", `seed` 12345,
+`n_snapshots` 1001, `pilot` 0, `code_version` 0.1.0, `git_commit` 95711303...-dirty
+(all snapshots were written at HEAD 9571130 with uncommitted work), and the Dan Whitt
+`credit`. See [Reading the cutouts](../README.md#reading-the-cutouts) in the README for
+how to open and select from it.
+
+**Run.** 8 workers. The extraction took 603 s wall for 989 snapshots (2.7-13.7 s each,
+mostly S3 reads). It was followed by a 15 s resume of the 12 snapshots that had crashed
+(below) and a 58 s concatenation, about 11.3 min in all.
+
+**Edge bug, fixed.** 12 snapshots failed with `IndexError` in `tile_snapshot`. When the
+widest tile of a strip ends on the last column of the face slice, the next strip starts
+at `i0 == width` and indexed past the edge. The loop is now `while i0 < dx.shape[1]`,
+with a regression test. The other 989 snapshots are unaffected by the change and were
+not re-extracted. Only the 12 failed hours were rerun.
+
+**Time.** First 2023-01-01 01:00, last 2024-01-31 21:00 UTC. The 1,001 distinct snapshot
+times equal `snapshot_hours()` for the 9/10 h schedule exactly, and neither missing hour
+is on it.
+
+- *UTC hour* (24 bins): 40-42 snapshots per hour (snapshot count χ² 0.2, dof 23) and
+  7,832-8,297 cutouts per hour, max/min 1.059. Against uniform, χ² is 34.3 (p 0.06). That
+  spread is entirely the 40-vs-42 snapshot count: against the snapshot counts, χ² is 3.7
+  (p 1.0), and the mean yield per hour is 194.3-197.5.
+- *Month* (13 bins, 2023-01 to 2024-01): 490.7-502.3 cutouts per day (max/min 1.024).
+  Cutouts per month against days in the month give χ² 10.7 (dof 12, p 0.56). The mean
+  yield per month is 195.0-197.6, so there is no seasonal signal.
+
+![Time sampling](figures/full_time_histograms.png)
+
+*Left: cutouts (bars) and snapshots (dots) per UTC hour. Right: cutouts per day (bars)
+and mean tiles per snapshot (squares) per month.*
+
+**Yield.** 184-209 cutouts per snapshot: mean 196.28, median 193, std 6.93. That is
+**3.8% below** the pilot projection (204.0 x 1,001 = 204,204), and 1.8% short of the
+200,000 goal. The distribution is **bimodal**, set by how many strips of kept tiles the
+seeded offset produces. The 540 snapshots with 12 strips yield 184-194 (mean 190.2), and
+the 461 with 13 strips yield 199-209 (mean 203.4). Both pilot snapshots (206, 202) were
+13-strip cases, which explains the optimistic projection. The yield does not drift with
+time.
+
+![Per-snapshot yield](figures/full_yield.png)
+
+*Left: yield per snapshot and a 37-snapshot running mean. Right: histogram, showing the
+12-strip and 13-strip modes; dashed = mean, dotted = pilot 204.0.*
+
+**Statistics** (per cutout, on the 64 x 64 image; gradients from `np.gradient` with the
+realized pixel size):
+
+| quantity | units | min | p5 | median | p95 | max |
+|---|---|---|---|---|---|---|
+| mean | °C | 1.035 | 8.624 | 21.34 | 28.14 | 31.29 |
+| std | °C | 0.0166 | 0.136 | 0.531 | 2.98 | 6.81 |
+| min | °C | -0.831 | 5.386 | 19.94 | 27.39 | 30.59 |
+| max | °C | 1.907 | 13.76 | 23.09 | 28.93 | 32.06 |
+| p10 | °C | 0.118 | 6.407 | 20.50 | 27.70 | 30.82 |
+| p90 | °C | 1.504 | 10.96 | 22.39 | 28.64 | 31.73 |
+| grad_mean | °C/km | 0.0018 | 0.0118 | 0.0360 | 0.162 | 0.373 |
+| grad_p90 | °C/km | 0.0034 | 0.0247 | 0.0821 | 0.396 | 1.209 |
+| grad_max | °C/km | 0.0150 | 0.0717 | 0.316 | 1.855 | 5.37 |
+| km_w | km | 128.00 | 128.1 | 128.9 | 129.8 | 129.96 |
+| km_h | km | 128.01 | 128.1 | 128.9 | 129.7 | 129.83 |
+| nj | cells | 65 | 65 | 69 | 77 | 79 |
+| ni | cells | 70 | 70 | 75 | 82 | 84 |
+| min_depth | m | 11.1 | 21.6 | 3670 | 5173 | 5395 |
+
+Across all 804,773,888 pixels, `sst` spans -0.831 to 32.061 °C. The mean SST is bimodal:
+the subtropical gyre and Sargasso Sea (about 20-28 °C) plus a cold tail from the Slope
+Sea and Labrador Current water north of the Stream. About 5% of cutouts sit on the shelf
+(min_depth below about 22 m; the plan keeps them).
+
+![Statistic histograms](figures/full_stat_histograms.png)
+
+*Histograms of the nine statistics, the realized extents and min_depth; dashed =
+median; gradient panels log-y, min_depth log-x.*
+
+**Spatial coverage.** The cutout centres span 30.20-44.61N and 79.66-50.34W, filling
+the ocean part of the box. Land and the band within about 64 km of the coast are empty.
+At large scale the density is uniform: in an open-ocean interior (33-41N, 65-52W;
+61,297 cutouts), 1° bins have CV 0.051 (Poisson 0.041) and 2° bins CV 0.028 (Poisson
+0.021). **At the tile scale it is not.** Along native `i` (latitude), 47 of 512 interior
+rows never hold a cutout centre and the counts per row have CV 0.54 (range 0-440,
+Poisson 0.09). Along `j` (longitude) the modulation is close to Poisson (CV 0.11 vs
+0.10, no empty columns).
+
+The cause is the tiling. `tile_snapshot` draws `i_off` from `[0, ni_typ)` with `ni_typ`
+taken from the *median* spacing, and each strip then advances by an integer `max_ni`
+that shrinks southward (84 cells near 44N, 70 near 31N). The set of reachable strip
+starts therefore compresses from strip to strip and stops covering a full tile period.
+The cutouts themselves are unaffected: every one is 100% ocean and fixed-km. What is
+affected is where the centres sit within a ~128 km period in latitude, so fixed features
+recur at preferred positions within the cutouts. The dotted row near 32N in the mean-SST
+map below is this effect in noisy 0.25° bins. This matters little for population
+statistics. If exact uniformity is wanted, a future run could lay strips in km rather
+than in cells, or draw a fresh offset per strip. **Not re-extracted.**
+
+![Spatial coverage](figures/full_coverage.png)
+
+*Top: centres per 1° bin and mean cutout SST per 0.25° bin, with the box dashed and the
+interior region in green. Bottom: centres per native row `ci` and column `cj` in the
+interior.*
+
+**Checks** (all PASS; `verify_cutouts_nc.py` exits 0). The `check_cutout_file.py` layout
+checks: dims `(cutout, y, x)`, all table variables, int64 UID, chunks (1024, 64, 64),
+zlib 1, `n_cutouts` attribute, centre inside corners, credit. Then: no NaN in `sst`
+(streamed, 0 of 804.8 M); unique UIDs; `lat_ne > lat_sw`; `lon_ne > lon_sw`; resampling
+ratio min(nj, ni)/64 = 1.016-1.234 ≥ 1; km_w, km_h ≥ 128; centre in box; distinct times
+equal the 9/10 h schedule and `n_snapshots`; all 24 UTC hours visited with snapshot
+counts within 2; per-hour and per-month mean yield within 3% of the overall mean; all
+13 months present; per-snapshot yields sum to the count; and 1° and 2° coverage CV
+below 2x Poisson.
+
+**Example cutouts.**
+
+![Twelve random cutouts across the year](figures/full_example_cutouts.png)
+
+*Twelve cutouts, one drawn at random (seed 2023) from each twelfth of the time span.
+Each is drawn north-up / east-right at its stored SW/NE corners, with its own colour
+scale. The panels show the range of structure: the Gulf Stream front with its sharp
+north wall (2023-08-06), meanders and filaments, warm- and cold-core rings, and quiet
+late-summer Sargasso Sea water (std 0.14 °C on 2023-09-03).*
+
+![Extreme cutouts, demeaned](figures/full_example_cutouts_extremes.png)
+
+*Extremes, demeaned, each panel with its own symmetric scale. Rows: the three highest
+grad_p90 (1.05-1.21 °C/km, std 4-5 °C, all Gulf Stream fronts in March); the three
+lowest std (0.02 °C, a weak eddy in the Sargasso Sea in February); the three warmest
+means (31.0-31.3 °C, the Florida Current / South Atlantic Bight in mid-August); and the
+three coldest means (1.0-1.2 °C, the Grand Banks / Labrador Current edge near 44-45N,
+50-52W in late March).*
+
 ## Risks and open items
 
 - Consecutive snapshots 9-10 h apart share most mesoscale structure, so the effective

@@ -23,7 +23,20 @@ import xarray as xr
 from st_sst.extract import llc_v2_cutouts as cut
 
 
-def main(path: str) -> int:
+def sst_all_finite(path: str, block: int = 1024) -> bool:
+    """True if every ``sst`` value is finite, streaming *block* cutouts at a time."""
+    import netCDF4
+    with netCDF4.Dataset(path) as nc:
+        v = nc.variables['sst']
+        v.set_auto_mask(False)
+        n = v.shape[0]
+        for k in range(0, n, block):
+            if not np.isfinite(v[k:k + block]).all():
+                return False
+    return True
+
+
+def main(path: str, list_snapshots: bool = True) -> int:
     import netCDF4
     ds = xr.open_dataset(path)
     n = ds.sizes['cutout']
@@ -31,7 +44,7 @@ def main(path: str) -> int:
         'dims (cutout, y, x)': ds['sst'].dims == ('cutout', 'y', 'x'),
         'all table variables present': set(cut.TABLE_COLUMNS) <= set(ds.data_vars),
         'n_cutouts attr matches': int(ds.attrs.get('n_cutouts', -1)) == n,
-        'no NaN in sst': bool(np.isfinite(ds['sst'].values).all()),
+        'no NaN in sst': sst_all_finite(path),
         'UID int64': ds['UID'].dtype == np.int64,
         'UIDs unique': pd.Index(ds['UID'].values).is_unique,
         'lat_ne > lat_sw': bool((ds['lat_ne'] > ds['lat_sw']).all()),
@@ -53,8 +66,9 @@ def main(path: str) -> int:
     for k, ok in checks.items():
         print(f"  [{'ok' if ok else 'FAIL'}] {k}")
     per = pd.Series(ds['time'].values).value_counts().sort_index()
-    print("cutouts per snapshot:")
-    for t, c in per.items():
+    print(f"cutouts per snapshot: {per.size} snapshots, {per.min()}-{per.max()}, "
+          f"mean {per.mean():.1f}")
+    for t, c in (per.items() if list_snapshots else ()):
         print(f"  {t:%Y-%m-%d %H:%M} UTC  {c}")
     for col in ('km_w', 'km_h', 'nj', 'ni', 'min_depth', 'mean', 'std', 'grad_mean', 'grad_max'):
         x = ds[col].values
