@@ -3,8 +3,10 @@
 Building blocks for the Gulf Stream cutout dataset specified in
 ``reports/extract_llc4320v2_gulf_stream.md``.  Everything here is a pure
 function of numpy arrays, so it is tested on a synthetic grid without the
-network; the per-snapshot reader, the NetCDF layer and the driver script sit
-on top of these.
+network.  On top of them sit the per-snapshot extractor (`extract_snapshot`,
+reading through ``wrangler.ogcm.llc_v2_access``) and the NetCDF layer
+(`write_snapshot_nc`, `concatenate_snapshots`); the driver is
+``st_sst/scripts/extract_gulf_stream.py``.
 
 Geometry conventions
 --------------------
@@ -228,7 +230,7 @@ def tile_snapshot(xc, yc, dx, dy, ocean, box, km: float, rng, min_cells: int = 1
 
     tiles = []
     i0 = i_off
-    while True:
+    while i0 < dx.shape[1]:          # a strip ending exactly on the edge leaves i0 == width
         j0, max_ni, any_i = j_off, 0, False
         while True:
             ej = cells_for_km(dy[:, i0], j0, km, min_cells)
@@ -348,3 +350,348 @@ def snapshot_hours(start=RECORD_START, end=RECORD_END, steps=DEFAULT_STEPS) -> l
         t += timedelta(hours=int(steps[k % len(steps)]))
         k += 1
     return out
+
+
+# ---------------------------------------------------------------------------
+# Per-snapshot extraction
+# ---------------------------------------------------------------------------
+
+#: Columns of the per-cutout table, in output order.
+TABLE_COLUMNS = ('UID', 'time', 'lat', 'lon', 'face', 'j0', 'i0', 'nj', 'ni',
+                 'km_w', 'km_h', 'lat_sw', 'lon_sw', 'lat_ne', 'lon_ne', 'min_depth') + STAT_KEYS
+
+#: Fixed time encoding, so per-snapshot files concatenate without re-encoding.
+TIME_UNITS = 'hours since 2023-01-01 00:00:00'
+
+CREDIT = ("The LLC4320_v2 simulation was produced and is owned by Dan Whitt (NASA Ames), "
+          "who agreed to its public copy; please credit him in any publication that uses "
+          "these data, and contact him regarding the simulation itself. The public copy was "
+          "assembled by J. Xavier Prochaska with the wrangler package.")
+
+
+def snapshot_seed(seed: int, date) -> int:
+    """Deterministic per-snapshot seed from a base *seed* and the snapshot hour.
+
+    Mixes the two through ``numpy.random.SeedSequence`` so neighbouring hours
+    get unrelated tilings, and a rerun of any snapshot reproduces its own.
+    """
+    hours = int((parse_utc(date) - datetime(1970, 1, 1, tzinfo=timezone.utc)).total_seconds()
+                // 3600)
+    return int(np.random.SeedSequence([int(seed), hours]).generate_state(1, dtype=np.uint32)[0])
+
+
+def snapshot_tag(date) -> str:
+    """``'2023-02-01 12:00'`` -> ``'20230201T12'`` (the store and intermediate-file stem)."""
+    return parse_utc(date).strftime('%Y%m%dT%H')
+
+
+def _face_arrays(grid, face: int, js: slice, isl: slice) -> dict:
+    """Grid fields of one face rectangle as numpy, staggered axes sliced explicitly.
+
+    ``dxC`` lives on ``(face, j, i_g)`` and ``dyC`` on ``(face, j_g, i)``, so
+    ``isel(j=, i=)`` alone would leave their staggered axis whole.
+    """
+    g = grid.isel(face=face, j=js, i=isl)
+    return {'xc': g['XC'].values.astype(np.float64),
+            'yc': g['YC'].values.astype(np.float64),
+            'mask': g['maskC'].values.astype(bool),
+            'depth': g['Depth'].values,
+            'dx': grid['dxC'].isel(face=face, j=js, i_g=isl).values.astype(np.float64) / 1000.,
+            'dy': grid['dyC'].isel(face=face, j_g=js, i=isl).values.astype(np.float64) / 1000.}
+
+
+def extract_snapshot(date, grid=None, box=DEFAULT_BOX, km: float = DEFAULT_KM,
+                     npix: int = DEFAULT_NPIX, seed: int = 0, store=None, slices=None,
+                     root: str = None, variable: str = 'Theta'):
+    """All fully-ocean fixed-km cutouts of one hourly snapshot.
+
+    Reads only the face/index rectangle(s) that `region_slices` gives for *box*,
+    tiles each with `tile_snapshot` (offset drawn from `snapshot_seed`), builds
+    each cutout with `make_cutout`, and fills the per-cutout table.
+
+    Args:
+        date: the snapshot hour (UTC).
+        grid (xarray.Dataset, optional): an open ``grid.zarr``; opened if None.
+        box (tuple): ``(lat_min, lat_max, lon_min, lon_max)``.
+        km (float): cutout side.
+        npix (int): output side in pixels (also the minimum native cell count).
+        seed (int): base seed; the tiling uses ``snapshot_seed(seed, date)``.
+        store (xarray.Dataset, optional): the already-open hourly store (tests).
+        slices (dict, optional): ``{face: (slice_j, slice_i)}``; from
+            `region_slices` if None.
+        root (str, optional): product root for the wrangler readers.
+        variable (str): field to cut, default ``'Theta'``.
+
+    Returns:
+        tuple: ``(cube, table)`` -- ``(n, npix, npix)`` float32 and a
+            ``pandas.DataFrame`` with `TABLE_COLUMNS`.
+
+    Raises:
+        Whatever ``open_store`` raises for a missing hour.
+    """
+    from wrangler.ogcm import llc_v2_access as llc
+    kw = {} if root is None else {'root': root}
+    lat_min, lat_max, lon_min, lon_max = box
+    if slices is None:
+        slices = llc.region_slices(lat_min, lat_max, lon_min, lon_max, **kw)
+    if grid is None:
+        grid = llc.open_grid(**kw)
+    if store is None:
+        store = llc.open_store(date, **kw)
+    rng = np.random.default_rng(snapshot_seed(seed, date))
+    t64 = np.datetime64(parse_utc(date).replace(tzinfo=None), 'ns')
+
+    images, rows = [], []
+    for face, (js, isl) in sorted(slices.items()):
+        a = _face_arrays(grid, face, js, isl)
+        theta = store[variable].isel(face=face, j=js, i=isl).values
+        ocean = a['mask'] & np.isfinite(theta)
+        orient = face_orientation(a['xc'], a['yc'])
+        tiles = tile_snapshot(a['xc'], a['yc'], a['dx'], a['dy'], ocean, box, km, rng,
+                              min_cells=npix)
+        for t in tiles:
+            j0, i0, nj, ni = t['j0'], t['i0'], t['nj'], t['ni']
+            img = make_cutout(theta, j0, i0, nj, ni, npix, orient)
+            km_w, km_h = oriented_km(t['km_j'], t['km_i'], orient)
+            c = tile_corners(a['xc'], a['yc'], j0, i0, nj, ni, orient)
+            row = {'time': t64, 'lat': t['lat'], 'lon': t['lon'], 'face': int(face),
+                   'j0': int(js.start or 0) + j0, 'i0': int(isl.start or 0) + i0,
+                   'nj': nj, 'ni': ni, 'km_w': km_w, 'km_h': km_h,
+                   'lat_sw': c['lat_sw'], 'lon_sw': c['lon_sw'],
+                   'lat_ne': c['lat_ne'], 'lon_ne': c['lon_ne'],
+                   'min_depth': float(np.min(a['depth'][j0:j0 + nj, i0:i0 + ni]))}
+            row.update(cutout_stats(img, km_w, km_h))
+            images.append(img)
+            rows.append(row)
+
+    cube = (np.stack(images).astype(np.float32) if images
+            else np.zeros((0, npix, npix), dtype=np.float32))
+    table = pd.DataFrame(rows, columns=[c for c in TABLE_COLUMNS if c != 'UID'])
+    table['time'] = pd.to_datetime(table['time']).astype('datetime64[ns]')
+    table.insert(0, 'UID', make_uid(table['time'], table['lat'].values, table['lon'].values)
+                 if len(table) else np.array([], dtype=np.int64))
+    for col in ('face', 'j0', 'i0', 'nj', 'ni'):
+        table[col] = table[col].astype(np.int32)
+    logger.info("%s: %d cutouts", snapshot_tag(date), len(table))
+    return cube, table
+
+
+# ---------------------------------------------------------------------------
+# NetCDF layer
+# ---------------------------------------------------------------------------
+
+_VAR_ATTRS = {
+    'sst': {'long_name': 'sea surface temperature (Theta, top cell)', 'units': 'degC'},
+    'UID': {'long_name': 'unique cutout identifier (wrangler datetime-lat-lon formula)'},
+    'time': {'standard_name': 'time', 'long_name': 'UTC time of the snapshot'},
+    'lat': {'long_name': 'latitude of the tile centre cell', 'units': 'degrees_north'},
+    'lon': {'long_name': 'longitude of the tile centre cell', 'units': 'degrees_east'},
+    'face': {'long_name': 'LLC face (0-12)'},
+    'j0': {'long_name': 'native j of the tile origin on the face'},
+    'i0': {'long_name': 'native i of the tile origin on the face'},
+    'nj': {'long_name': 'native cells of the tile along j'},
+    'ni': {'long_name': 'native cells of the tile along i'},
+    'km_w': {'long_name': 'realized width (west-east) of the cutout', 'units': 'km'},
+    'km_h': {'long_name': 'realized height (south-north) of the cutout', 'units': 'km'},
+    'lat_sw': {'long_name': 'latitude of the south-west (bottom-left) native cell',
+               'units': 'degrees_north'},
+    'lon_sw': {'long_name': 'longitude of the south-west (bottom-left) native cell',
+               'units': 'degrees_east'},
+    'lat_ne': {'long_name': 'latitude of the north-east (top-right) native cell',
+               'units': 'degrees_north'},
+    'lon_ne': {'long_name': 'longitude of the north-east (top-right) native cell',
+               'units': 'degrees_east'},
+    'min_depth': {'long_name': 'minimum ocean depth over the native tile', 'units': 'm'},
+    'mean': {'long_name': 'mean SST of the cutout', 'units': 'degC'},
+    'std': {'long_name': 'standard deviation of SST of the cutout', 'units': 'degC'},
+    'min': {'long_name': 'minimum SST of the cutout', 'units': 'degC'},
+    'max': {'long_name': 'maximum SST of the cutout', 'units': 'degC'},
+    'p10': {'long_name': '10th percentile of SST of the cutout', 'units': 'degC'},
+    'p90': {'long_name': '90th percentile of SST of the cutout', 'units': 'degC'},
+    'grad_mean': {'long_name': 'mean |grad SST| of the cutout', 'units': 'degC/km'},
+    'grad_p90': {'long_name': '90th percentile |grad SST| of the cutout', 'units': 'degC/km'},
+    'grad_max': {'long_name': 'maximum |grad SST| of the cutout', 'units': 'degC/km'},
+}
+
+
+def git_commit(path: str = None) -> str:
+    """HEAD commit of the repository holding *path* (read-only), or ``'unknown'``."""
+    import subprocess
+    import os
+    path = path or os.path.dirname(os.path.abspath(__file__))
+    try:
+        sha = subprocess.run(['git', 'rev-parse', 'HEAD'], cwd=path, capture_output=True,
+                             text=True, check=True).stdout.strip()
+        dirty = subprocess.run(['git', 'status', '--porcelain', '--untracked-files=no'],
+                               cwd=path, capture_output=True, text=True, check=True).stdout
+        return sha + ('-dirty' if dirty.strip() else '')
+    except Exception:                                     # pragma: no cover
+        return 'unknown'
+
+
+def global_attrs(box=DEFAULT_BOX, km: float = DEFAULT_KM, npix: int = DEFAULT_NPIX,
+                 steps=DEFAULT_STEPS, seed: int = 0, root: str = None, **extra) -> dict:
+    """Global attributes of a cutout file (plan, design item 6)."""
+    import st_sst
+    from wrangler.ogcm import llc_v2_access as llc
+    attrs = {
+        'title': 'LLC4320_v2 Gulf Stream SST cutouts',
+        'source': 'LLC4320_v2 hourly surface product (MITgcm LLC4320), field Theta',
+        'source_bucket': root or llc.DEFAULT_ROOT,
+        'source_endpoint': llc.DEFAULT_ENDPOINT,
+        'box_lat_min': float(box[0]), 'box_lat_max': float(box[1]),
+        'box_lon_min': float(box[2]), 'box_lon_max': float(box[3]),
+        'km': float(km), 'npix': int(npix),
+        'pixel_km_nominal': float(km) / int(npix),
+        'resampling': ('fixed-km native tile (dxC/dyC accumulated from the origin), '
+                       'transposed/flipped to north-up east-right, area-averaged with '
+                       'skimage.transform.resize_local_mean; never upsampled'),
+        'sampling': ('per snapshot: non-overlapping tiling in native index space with a '
+                     'seeded random offset; tiles kept when the centre is in the box and '
+                     'every cell is ocean (maskC and finite Theta)'),
+        'stride_hours': ' '.join(str(int(s)) for s in steps),
+        'seed': int(seed),
+        'seed_rule': 'per-snapshot seed = snapshot_seed(seed, hour) via numpy SeedSequence',
+        'code': 'st_sst.extract.llc_v2_cutouts',
+        'code_version': st_sst.__version__,
+        'git_commit': git_commit(),
+        'credit': CREDIT,
+        'creator': 'J. Xavier Prochaska (ST-SST)',
+        'date_created': datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ'),
+        'Conventions': 'CF-1.8',
+    }
+    attrs.update(extra)
+    return attrs
+
+
+def _encoding(n: int, npix: int) -> dict:
+    """NetCDF encoding: sst chunks ``(1024, npix, npix)`` (capped at *n*), zlib 1 everywhere."""
+    enc = {v: {'zlib': True, 'complevel': 1} for v in TABLE_COLUMNS}
+    enc['sst'] = {'zlib': True, 'complevel': 1, 'dtype': 'float32'}
+    if n > 0:
+        enc['sst']['chunksizes'] = (min(1024, n), npix, npix)
+    enc['time'].update({'units': TIME_UNITS, 'calendar': 'proleptic_gregorian',
+                        'dtype': 'float64'})
+    enc['UID']['dtype'] = 'int64'
+    return enc
+
+
+def to_dataset(cube, table, attrs: dict = None):
+    """``(cube, table)`` -> ``xarray.Dataset`` with dims ``(cutout, y, x)``."""
+    import xarray as xr
+    cube = np.asarray(cube, dtype=np.float32)
+    if cube.ndim != 3 or cube.shape[0] != len(table):
+        raise ValueError(f"cube {cube.shape} does not match a table of {len(table)} rows")
+    data = {'sst': (('cutout', 'y', 'x'), cube)}
+    for col in TABLE_COLUMNS:
+        vals = table[col].values
+        if col == 'UID':
+            vals = vals.astype(np.int64)
+        elif col == 'time':
+            vals = vals.astype('datetime64[ns]')
+        data[col] = ('cutout', vals)
+    ds = xr.Dataset(data, attrs=dict(attrs or {}))
+    for v, a in _VAR_ATTRS.items():
+        ds[v].attrs.update(a)
+    ds['y'] = ('y', np.arange(cube.shape[1], dtype=np.int32),
+               {'long_name': 'pixel row (north at y=0)'})
+    ds['x'] = ('x', np.arange(cube.shape[2], dtype=np.int32),
+               {'long_name': 'pixel column (west at x=0)'})
+    return ds
+
+
+def write_snapshot_nc(path: str, cube, table, attrs: dict = None) -> str:
+    """Write one snapshot's cutouts to NetCDF4 (the plan's layout), atomically.
+
+    Written to ``path + '.part'`` and renamed, so a file that exists is
+    complete and the driver can resume by skipping it.
+    """
+    import os
+    ds = to_dataset(cube, table, attrs)
+    os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
+    tmp = path + '.part'
+    ds.to_netcdf(tmp, format='NETCDF4', engine='netcdf4',
+                 encoding=_encoding(len(table), cube.shape[1]))
+    os.replace(tmp, path)
+    return path
+
+
+_SNAPSHOT_ONLY_ATTRS = ('snapshot_time', 'snapshot_seed', 'n_cutouts', 'date_created')
+
+
+def concatenate_snapshots(paths, outfile: str, attrs: dict = None) -> int:
+    """Concatenate per-snapshot files along ``cutout`` into one NetCDF4 file.
+
+    Streams one snapshot at a time through ``netCDF4`` (the full dataset is a
+    few GB), keeping each variable's dtype, attributes and encoded values (all
+    files share `TIME_UNITS`), with ``sst`` chunked ``(1024, y, x)`` and zlib 1.
+    Global attributes come from the first file, minus the per-snapshot ones,
+    plus ``n_cutouts``, ``n_snapshots``, the time coverage and *attrs*.
+
+    Returns:
+        int: number of cutouts written.
+    """
+    import os
+    import netCDF4
+
+    paths = sorted(paths)
+    if not paths:
+        raise ValueError("no snapshot files to concatenate")
+    sizes = []
+    for p in paths:
+        with netCDF4.Dataset(p) as src:
+            sizes.append(len(src.dimensions['cutout']))
+    n = int(sum(sizes))
+
+    tmp = outfile + '.part'
+    with netCDF4.Dataset(paths[0]) as first, netCDF4.Dataset(tmp, 'w', format='NETCDF4') as dst:
+        ny, nx = len(first.dimensions['y']), len(first.dimensions['x'])
+        dst.createDimension('cutout', n)
+        dst.createDimension('y', ny)
+        dst.createDimension('x', nx)
+        out_vars = {}
+        for name, v in first.variables.items():
+            kw = {'zlib': True, 'complevel': 1}
+            if name == 'sst' and n > 0:
+                kw['chunksizes'] = (min(1024, n), ny, nx)
+            fill = v.getncattr('_FillValue') if '_FillValue' in v.ncattrs() else None
+            ov = dst.createVariable(name, v.dtype, v.dimensions, fill_value=fill, **kw)
+            ov.setncatts({a: v.getncattr(a) for a in v.ncattrs() if a != '_FillValue'})
+            if v.dimensions in (('y',), ('x',)):
+                ov[:] = v[:]
+            out_vars[name] = ov
+        gatts = {a: first.getncattr(a) for a in first.ncattrs()
+                 if a not in _SNAPSHOT_ONLY_ATTRS}
+
+        k = 0
+        tmin, tmax = None, None
+        for p, m in zip(paths, sizes):
+            if m == 0:
+                continue
+            with netCDF4.Dataset(p) as src:
+                src.set_auto_maskandscale(False)
+                for name, ov in out_vars.items():
+                    if 'cutout' in src.variables[name].dimensions:
+                        ov.set_auto_maskandscale(False)
+                        ov[k:k + m] = src.variables[name][:]
+                tv = src.variables['time'][:]
+                tmin = tv.min() if tmin is None else min(tmin, tv.min())
+                tmax = tv.max() if tmax is None else max(tmax, tv.max())
+            k += m
+
+        tunits = first.variables['time'].getncattr('units')
+        cal = first.variables['time'].getncattr('calendar') \
+            if 'calendar' in first.variables['time'].ncattrs() else 'standard'
+        gatts.update({'n_cutouts': n, 'n_snapshots': len(paths),
+                      'snapshot_files': ' '.join(os.path.basename(p) for p in paths)
+                      if len(paths) <= 50 else f'{len(paths)} files',
+                      'date_created': datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')})
+        if tmin is not None:
+            fmt = '%Y-%m-%dT%H:%M:%SZ'
+            gatts['time_coverage_start'] = netCDF4.num2date(tmin, tunits, cal).strftime(fmt)
+            gatts['time_coverage_end'] = netCDF4.num2date(tmax, tunits, cal).strftime(fmt)
+        gatts.update(attrs or {})
+        dst.setncatts(gatts)
+    os.replace(tmp, outfile)
+    logger.info("wrote %s: %d cutouts from %d snapshots", outfile, n, len(paths))
+    return n

@@ -480,3 +480,205 @@ What I learned:
 - `conda run` does not forward a heredoc on stdin; probe scripts go in a file.
 
 No git commands that change repository state were run.
+
+### 2026-11-02 (Implement #2: extractor, NetCDF layer, driver, pilot run)
+
+Executed Implement prompt #2 (Claude Opus 5.5): added the per-snapshot extractor and the
+NetCDF layer to `st_sst/extract/llc_v2_cutouts.py`, wrote the driver, and ran the pilot.
+28 tests pass under `conda run -n ocean14 python -m pytest -q` (23 existing + 5 new,
+~4 s, no network).
+
+What was done:
+
+- `st_sst/extract/llc_v2_cutouts.py`: `extract_snapshot(date, grid, box, km, npix, seed)`
+  reads only the face rectangle(s) from `region_slices` (face 10, j 2288-3759,
+  i 2400-3423 for the default box), with `dxC` sliced on `(j, i_g)` and `dyC` on
+  `(j_g, i)`; ocean = `maskC` and finite `Theta`; tiles with `tile_snapshot`
+  (`min_cells=npix`), cuts with `make_cutout`, and fills the plan's table (UID, time,
+  centre lat/lon, face, face-absolute j0/i0, nj/ni, km_w/km_h, corners, min_depth and
+  the nine statistics). Optional `store=`/`slices=`/`root=` let it run on in-memory
+  datasets. Also `snapshot_seed` (per-snapshot seed from the base seed and the hour via
+  `SeedSequence`), `snapshot_tag`, `global_attrs` (bucket, endpoint, box, km, npix,
+  resampling, sampling, stride, seed, code version, git commit, Dan Whitt credit),
+  `to_dataset`, `write_snapshot_nc` (written to `.part` then renamed, so an existing
+  file is always complete) and `concatenate_snapshots` (streams files through
+  `netCDF4`, keeping encoded values; `sst` chunks `(min(1024, n), 64, 64)`, zlib 1).
+  Time is encoded with a fixed `hours since 2023-01-01 00:00:00` so files concatenate
+  without re-encoding.
+- `st_sst/scripts/extract_gulf_stream.py`: `--pilot`, `--box`, `--km`, `--npix`, `--seed`
+  (default 12345), `--stride`, `--start/--end`, `--n-cores`, `--outdir` (default
+  `$OS_OGCM/LLC_v2/cutouts`), `--dry-run`, `--concatenate`; resumes by skipping existing
+  `snapshots/{YYYYMMDD}T{HH}.nc`; `ProcessPoolExecutor` over snapshots; a failed hour
+  (e.g. a missing store) is logged as a warning and skipped. Run as
+  `conda run -n ocean14 python -m st_sst.scripts.extract_gulf_stream ...` from the repo
+  root (st_sst is not installed in ocean14). The full schedule is 1,001 snapshots.
+- `st_sst/scripts/check_cutout_file.py`: layout and invariant checks on a concatenated
+  file (dims, count, no NaN, unique int64 UIDs, corner ordering, chunking/compression),
+  plus per-snapshot yield and ranges of extents and statistics.
+- Tests: `extract_snapshot` on a synthetic store (cube/table shapes, columns, unique
+  UIDs, cutout means equal native-tile means, north-up, extents 128-130 km), seeding and
+  face-absolute indices with an offset slice, `snapshot_seed`, and a
+  `write_snapshot_nc` + `concatenate_snapshots` round trip (including an empty
+  snapshot) checking dims, variables, int64 UID, times, chunking `(1024, 64, 64)`, zlib 1
+  and the global attributes.
+
+Pilot (2023-02-01 12:00 and 2023-08-01 12:00 UTC, seed 12345, 2 workers):
+
+- **206 and 202 tiles** (408 cutouts, 204 per snapshot, vs ~201 predicted).
+- Wall time 7.4 s for the extraction (6.0 and 6.9 s per snapshot, mostly S3 reads),
+  9.9 s end to end; concatenation 0.2 s.
+- `$OS_OGCM/LLC_v2/cutouts/LLC4320v2_GulfStream_SST_128km_64px_pilot.nc`, 4.0 MB
+  (snapshot files 2.1 and 2.0 MB), with `$OS_OGCM=/home/xavier/Oceanography/data/OGCM/`.
+- All checks pass: dims `(cutout, y, x)`, 408 cutouts, no NaN, unique UIDs,
+  `lat_ne > lat_sw`, `lon_ne > lon_sw`. km_w 128.0-129.9, km_h 128.0-129.4; nj 65-79,
+  ni 70-83 (never below 64); mean SST 3.9-30.2 °C; min_depth down to 11 m (shelf tiles
+  are kept, as the plan only requires all-ocean cells).
+- At ~6.5 s per snapshot the full 1,001-snapshot run is ~15 min with 8 workers and
+  ~204,000 cutouts at the 9/10 h stride, so the stride can stay as planned.
+
+What I learned:
+
+- The real `region_slices` rectangle (j 2288-3760, i 2400-3424) is the coarse-grid
+  rectangle padded by one 16-cell step, a little larger than the measured 2304-3743 /
+  2414-3400; the box test in `tile_snapshot` handles the padding.
+- `Theta` in the hourly store is float32 on `(face, j, i)` with no time dimension;
+  `grid.zarr` has `dxC` on `(face, j, i_g)` and `dyC` on `(face, j_g, i)`, in metres.
+- Importing `wrangler.preproc.meta` pulls in argopy, which logs "Using ONLINE Argo
+  Float implementation" in every worker; harmless.
+- `st_sst` is not installed in `ocean14`, so scripts must be run with `python -m` from
+  the repository root (or the package installed with `pip install -e .`).
+- The `git_commit` attribute carries `-dirty` while the working tree has uncommitted
+  changes, as it did for the pilot (HEAD 9571130); rerun after committing for a clean
+  provenance string if wanted.
+- `sst` chunks are capped at the cutout count, so the pilot file is chunked
+  `(408, 64, 64)`; the full file will have the planned `(1024, 64, 64)`.
+
+No git commands that change repository state were run.
+
+### 2026-11-02 (Implement #3: pilot validation)
+
+Executed Implement prompt #3 (Claude Opus 5.5): wrote `st_sst/scripts/plot_pilot_cutouts.py`,
+validated the pilot file, and appended a "Pilot results" section to
+`reports/extract_llc4320v2_gulf_stream.md`. All checks pass, so nothing was changed in
+the library or driver and the pilot was not re-extracted. 28 tests still pass under
+`conda run -n ocean14 python -m pytest -q`.
+
+What was done:
+
+- `st_sst/scripts/plot_pilot_cutouts.py` (`--file`, `--outdir`, `--n-cutouts`, `--n-spot`,
+  `--seed`, `--no-network`; ~18 s with the network): reuses `check_cutout_file.main` for
+  the layout checks, then checks `lat_ne > lat_sw`, `lon_ne > lon_sw`, no NaN, unique
+  UIDs, `min(nj, ni)/npix >= 1`, km >= 128 and centre in box; prints PASS/FAIL and exits
+  non-zero on any failure. Spot check: opens `grid.zarr` and the two hourly stores
+  through `wrangler.ogcm.llc_v2_access`, rebuilds every cutout from `Theta` with
+  `make_cutout`, recomputes 5 pixels in each of 3 cutouts with an explicit
+  area-weighted mean over the native cells (located through the orientation index map,
+  independent of skimage), and compares the stored corners with `XC`/`YC` of the SW/NE
+  native cells. Writes `reports/figures/pilot_map.png`, `pilot_cutouts.png`,
+  `pilot_extent_histograms.png`, and tabulates snapshots and expected cutouts for
+  candidate strides.
+
+Numbers:
+
+- Yield 206 + 202 = 408, **204.0 per snapshot**.
+- All 408 rebuilt cutouts are bit-identical to the stored ones (max |d| = 0); the
+  independent pixel-level area means agree to 1.9e-6 °C; corners agree exactly.
+- km_w 128.0-129.9, km_h 128.0-129.4; ni 70-83, nj 65-79; pixel 2.000-2.030 km
+  (median 2.022) by 2.001-2.022 km (median 2.016); resampling ratio 1.016-1.234.
+- Stride: 9/10 h gives 1,001 snapshots, ~204,200 cutouts, all 24 UTC hours (40-42
+  each); 8/9 gives ~228,100, 10 gives ~194,000 but only 12 UTC hours, 11 gives ~176,300.
+  **Keep 9/10.** Neither missing hour (2023-10-19 03, 2023-12-28 23) is on the schedule.
+
+What I learned:
+
+- On face 10 output pixel (y=0, x=0) is native `(j0, i0)` (NW); the SW cell is
+  `(j0, i0+ni-1)` and the NE cell `(j0+nj-1, i0)`. `face_orientation` gives
+  transpose only, no flips, as the plan said.
+- At ratios of 1.0-1.3 each output pixel averages 1-2 x 2-3 native cells with
+  fractional weights, so a pixel can only be checked against `Theta` through an area
+  mean; the explicit overlap-weight formula reproduces `resize_local_mean` to float32
+  precision.
+- The stored corners are cell centres, so outlines drawn from them are about one cell
+  (~2 km) smaller than the tile; tiles are kept by centre, so edge tiles reach ~0.2 deg
+  outside the box (lat_sw down to 29.8N).
+- An alternation `a/b` visits every UTC hour only if `a+b` is coprime with 24: 9/10 and
+  8/9 do, 10/11 (21) does not.
+
+No git commands that change repository state were run.
+
+### 2026-11-03 (Implement #4: full run)
+
+Executed Implement prompt #4 (Claude Opus 5.5): ran the full extraction over
+2023-01-01 01:00 to 2024-01-31 23:00 at the 9/10 h stride with 8 workers, fixed an
+edge-of-slice bug in `tile_snapshot` that crashed 12 snapshots, resumed them, and
+concatenated to `$OS_OGCM/LLC_v2/cutouts/LLC4320v2_GulfStream_SST_128km_64px.nc`
+(`$OS_OGCM=/home/xavier/Oceanography/data/OGCM/`). Per-snapshot files and the pilot
+file were left in place. 29 tests pass under `conda run -n ocean14 python -m pytest -q`
+(28 + 1 new).
+
+What was done:
+
+- Stride: `DEFAULT_STEPS = (9, 10)` in the library and the driver's `--stride` default
+  (`list(cut.DEFAULT_STEPS)`) were already 9/10, as the pilot yield supports; no change.
+  `--seed` defaults to 12345, `--start/--end` to the record bounds, `--outdir` to
+  `$OS_OGCM/LLC_v2/cutouts`.
+- `--dry-run`: 1,001 snapshots, first 2023-01-01 01:00, last 2024-01-31 21:00 UTC.
+  Neither missing hour (2023-10-19 03:00, 2023-12-28 23:00; neighbours 10-18 23:00 /
+  10-19 09:00 and 12-28 20:00) nor either pilot hour (2023-02-01 12:00, 2023-08-01 12:00)
+  is on the schedule. `--concatenate` already builds its file list from the schedule
+  (`snapshot_path` of each scheduled hour), not from a glob of `snapshots/`, so the two
+  pilot files are excluded; no driver change was needed.
+- Full run (`python -m st_sst.scripts.extract_gulf_stream --n-cores 8`, detached),
+  08:18:04 to 08:28:10 local: 989 snapshots, 193,998 cutouts in 603 s wall (2.7-13.7 s
+  per snapshot). **12 failed**, all with `IndexError: index 1024 is out of bounds for
+  axis 1 with size 1024` (20230122T00, 20230210T19, 20230228T15, 20230529T21,
+  20230619T20, 20230702T12, 20230707T16, 20230714T19, 20230720T08, 20230803T14,
+  20230825T08, 20240129T02). There were no S3 or missing-hour failures.
+- Bug and fix (`st_sst/extract/llc_v2_cutouts.py`, `tile_snapshot`): when the widest tile
+  of a strip ends exactly on the last column of the face slice (`i0 + max_ni == 1024`),
+  the next strip starts at `i0 = 1024` and `dy[:, i0]` raises before the "no tile fits"
+  test can end the loop. Whether this happens depends only on the seeded offset, so it
+  is deterministic. The outer loop is now `while i0 < dx.shape[1]`. The guard only matters
+  where the old code raised, so the 989 completed snapshots are unchanged and were not
+  re-extracted. Regression test `test_tile_snapshot_strip_ending_on_the_edge`
+  (`st_sst/tests/test_llc_v2_cutouts.py`) builds a slice of width
+  `i_off + 2*128` at 1 km spacing, which ends a strip exactly on the edge.
+- Resume (same command): 12 snapshots, 2,480 cutouts, 15.1 s wall, 0 failed. All 1,001
+  scheduled files exist (1,003 files in `snapshots/` with the two pilot files).
+- `--concatenate`: 196,478 cutouts from 1,001 snapshots in 57.8 s; file **1,911.5 MB**.
+- `python -m st_sst.scripts.check_cutout_file <file>`: all checks ok. Dims
+  `(cutout, y, x)` = (196478, 64, 64); sst chunks `[1024, 64, 64]`, zlib 1; no NaN;
+  int64 UIDs unique; `lat_ne > lat_sw`, `lon_ne > lon_sw`, centre inside corners;
+  `n_cutouts` matches; credit names Dan Whitt. Global attrs: `stride_hours` "9 10",
+  `seed` 12345, `n_snapshots` 1001, `pilot` 0, coverage 2023-01-01T01:00:00Z to
+  2024-01-31T21:00:00Z, `git_commit` 95711303...-dirty (HEAD 9571130, uncommitted work
+  from prompts #1-#4), `code_version` 0.1.0.
+
+Numbers:
+
+- **1,001 snapshots, 196,478 cutouts**, 184-209 tiles per snapshot (mean 196.3, median
+  193, std 6.9). Monthly means are flat, from 195.0 to 197.6, so there is no seasonal
+  signal in the yield.
+- km_w 128.00-129.96, km_h 128.01-129.83; nj 65-79, ni 70-84; min_depth 11-5395 m;
+  mean SST 1.0-31.3 °C; lat 30.20-44.61, lon -79.66 to -50.34.
+- Wall time: 603 s extraction plus 15 s resume (about 10.3 min with 8 workers), then
+  58 s concatenation.
+
+What I learned:
+
+- The mean yield (196.3) is below the pilot's 204.0. The pilot's two snapshots (206,
+  202) happened to fall high in a 184-209 spread that is set mostly by the random offset,
+  not by the date. The 12 offsets that end a strip on the slice edge fit an extra column
+  of tiles and yield 205-209. The full set is about 3.8% short of the ~204,200 projected
+  from the pilot, but still near the planned 200,000.
+- About 1.2% of seeded offsets (12/1,001) hit the edge case. The synthetic tests missed
+  it because their face sizes never lined up with a strip boundary.
+- With 8 workers a snapshot takes 3-14 s (median about 5 s), mostly S3 reads; 1,001
+  snapshots took about 10 min, a little faster than the 15 min projected from the pilot.
+- The concatenated file takes its global attrs, including `git_commit`, from the first
+  snapshot file. All snapshots were written at HEAD 9571130 with a dirty tree.
+- The bug-fix edit and the new test were applied with a short
+  system-`python3` text-substitution one-off, not the `ocean14` environment. It was a
+  file edit, not a calculation, but it does not follow the convention.
+
+No git commands that change repository state were run.

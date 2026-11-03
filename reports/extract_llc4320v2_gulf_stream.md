@@ -106,6 +106,73 @@ of reads, resumable. After concatenation verify: count, no NaN, unique UIDs, tim
 and the histogram of UTC hour (flat) and month (flat), per-snapshot yield, and the
 distribution of the statistics. Write the summary to this document.
 
+## Pilot results
+
+*2026-11-02, Implement #3 (Claude Opus 5.5). Produced by
+`conda run -n ocean14 python -m st_sst.scripts.plot_pilot_cutouts` on
+`$OS_OGCM/LLC_v2/cutouts/LLC4320v2_GulfStream_SST_128km_64px_pilot.nc` (seed 12345).*
+
+**Yield.** 206 tiles at 2023-02-01 12:00 and 202 at 2023-08-01 12:00 UTC: 408 cutouts,
+**204.0 per snapshot** (the plan predicted ~201). Extraction took 7.4 s wall with 2
+workers (6.0 and 6.9 s per snapshot, mostly S3 reads); concatenation 0.2 s; file 4.0 MB.
+
+**Extents.** km_w 128.0-129.9 km (median 129.4), km_h 128.0-129.4 km (median 129.0);
+ni 70-83 cells (along latitude), nj 65-79 (along longitude). Realized pixel size
+km_w/64 = 2.000-2.030 km (median 2.022), km_h/64 = 2.001-2.022 km (median 2.016):
+square to <1.5%. Resampling ratio min(nj, ni)/64 = 1.016-1.234, so every cutout is a
+downsample. Tiles are kept by centre, so edge tiles reach ~0.2 deg outside the box
+(e.g. lat_sw 29.8N).
+
+**Checks** (all PASS): `lat_ne > lat_sw`; `lon_ne > lon_sw`; no NaN in `sst`; unique
+UIDs; ratio >= 1; km_w, km_h >= 128; centre in box; plus the layout checks of
+`check_cutout_file.py` (dims, int64 UID, chunks, zlib 1, credit attribute).
+
+**Spot check against `Theta`** read directly from the hourly stores with xarray:
+
+- all 408 cutouts rebuilt from the native tiles at the stored `(face, j0:j0+nj,
+  i0:i0+ni)` with the library's orientation and `resize_local_mean`: max |difference|
+  **0** (bit-identical);
+- pixel level, independent of skimage: for 3 cutouts (2 from February, 1 from August),
+  5 pixels each (four corners and one interior) recomputed as an explicit area-weighted
+  mean of the native cells they cover (1-2 x 2-3 cells at these ratios; the 64 px
+  output is not a subsample, so a pixel can only be compared through this area mean):
+  max |difference| **1.9e-6 °C** (float32 rounding). Pixel (y=0, x=0) maps to native
+  `(j0, i0)`, i.e. NW; (y=63, x=0) to `(j0, i0+ni-1)`, SW.
+- corners: stored `lat_sw, lon_sw, lat_ne, lon_ne` equal `YC`/`XC` of the native SW cell
+  `(j0, i0+ni-1)` and NE cell `(j0+nj-1, i0)` exactly; across each oriented tile
+  latitude decreases strictly down the rows and longitude increases strictly along the
+  columns (face 10 orientation: transpose, no flips).
+
+![Pilot snapshots with tile outlines](figures/pilot_map.png)
+
+*SST of the two pilot snapshots over the box (dashed), with every tile drawn from its
+stored corners; bold outlines are the cutouts below.*
+
+![Six pilot cutouts](figures/pilot_cutouts.png)
+
+*Six cutouts drawn at their stored SW/NE corners, north-up / east-right, each with its
+own colour scale.*
+
+![Extent histograms](figures/pilot_extent_histograms.png)
+
+*km_w, km_h, ni, nj for the 408 cutouts, stacked by snapshot; dashed line npix = 64.*
+
+**Stride for the full run** (2023-01-01 01:00 to 2024-01-31 23:00, at 204.0 per
+snapshot; neither missing hour falls on any of these schedules):
+
+| steps (h) | snapshots | expected cutouts | UTC hours visited |
+|---|---|---|---|
+| **9/10** | **1,001** | **~204,200** | **24 (40-42 each)** |
+| 8/9 | 1,118 | ~228,100 | 24 |
+| 10/11 | 906 | ~184,800 | 16 |
+| 9 | 1,056 | ~215,400 | 8 |
+| 10 | 951 | ~194,000 | 12 |
+| 11 | 864 | ~176,300 | 24 |
+
+**Chosen: the planned 9/10 h alternation**, 1,001 snapshots, ~204,000 cutouts (±2%
+from the per-snapshot yield variation), with a flat UTC-hour histogram. Single strides
+of 9 or 10 h, and 10/11, visit only a subset of UTC hours. Nothing needed fixing.
+
 ## Risks and open items
 
 - Consecutive snapshots 9-10 h apart share most mesoscale structure, so the effective
